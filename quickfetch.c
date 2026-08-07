@@ -729,11 +729,38 @@ static void *gpuThread(void *arg) {
 static int renderInfoLines(char lines[MAX_INFO_LINES][INFO_LINE_LEN]) {
     QF_MARK(tStart);
 
-    /* Serial version: no threads at all. With each detector down to
-     * single-digit-to-low-double-digit microseconds, pthread_create's
-     * setup cost (mmap+guard page, kernel thread bookkeeping) can cost
-     * more than the parallelism it buys back. This runs everything in
-     * call order on the main thread. */
+    /* Launch all the real work up front: one thread for the four cheap
+     * detectors (bundled so they share a single thread's create/join
+     * cost), one for getCpu, one for getGpu. getGpu is normally the
+     * long pole, so the other two threads' work is effectively free —
+     * it happens hidden inside getGpu's latency instead of adding to
+     * the critical path. */
+    StrResult cpuR, gpuR;
+    CheapResult cheapR;
+
+    /* pthread_create defaults to an 8 MiB stack per thread. Every
+     * function reachable from these three threads uses well under 16 KiB
+     * of stack combined (the largest single buffer is getCpu's 8 KiB
+     * /proc/cpuinfo read); 128 KiB leaves generous headroom while
+     * asking the kernel to set up a far smaller mapping+guard page per
+     * thread than the default. */
+    pthread_attr_t smallStackAttr;
+    pthread_attr_init(&smallStackAttr);
+    pthread_attr_setstacksize(&smallStackAttr, 131072); /* 128 KiB */
+
+    pthread_t tCheap, tCpu, tGpu;
+    QF_MARK(tCreate0);
+    pthread_create(&tCheap, &smallStackAttr, cheapThread, &cheapR);
+    pthread_create(&tCpu, &smallStackAttr, cpuThread, &cpuR);
+    pthread_create(&tGpu, &smallStackAttr, gpuThread, &gpuR);
+    QF_MARK(tCreate1);
+    QF_LOG("pthread_create x3", tCreate0, tCreate1);
+
+    pthread_attr_destroy(&smallStackAttr);
+
+    /* getUserHost is trivial but still real I/O — do it on the main
+     * thread while the workers run, instead of paying for a 4th thread
+     * or serializing it before/after them. */
     char userHost[256];
     QF_MARK(tUh0);
     getUserHost(userHost, sizeof(userHost));
@@ -746,43 +773,22 @@ static int renderInfoLines(char lines[MAX_INFO_LINES][INFO_LINE_LEN]) {
     memset(separator, '-', hostLen);
     separator[hostLen] = '\0';
 
-    StrResult osR, shellR, terminalR, cpuR, gpuR;
-    MemResult memR;
+    QF_MARK(tJoin0);
+    pthread_join(tCheap, NULL);
+    pthread_join(tCpu, NULL);
+    pthread_join(tGpu, NULL);
+    QF_MARK(tJoin1);
+    QF_LOG("pthread_join x3 (wall)", tJoin0, tJoin1);
 
-    QF_MARK(tOs0);
-    getOS(osR.buf, sizeof(osR.buf));
-    QF_MARK(tOs1);
-    QF_LOG("getOS", tOs0, tOs1);
+#ifdef QF_TIMING
+    fprintf(stderr, "[qf] %-28s %.3f ms\n", "threads total (create+join)",
+            (tCreate1 - tCreate0) + (tJoin1 - tJoin0));
+#endif
 
-    QF_MARK(tShell0);
-    getShell(shellR.buf, sizeof(shellR.buf));
-    QF_MARK(tShell1);
-    QF_LOG("getShell", tShell0, tShell1);
-
-    QF_MARK(tTerm0);
-    getTerminal(terminalR.buf, sizeof(terminalR.buf));
-    QF_MARK(tTerm1);
-    QF_LOG("getTerminal", tTerm0, tTerm1);
-
-    QF_MARK(tMem0);
-    getMemory(&memR.totalGiB, &memR.usedPercent);
-    QF_MARK(tMem1);
-    QF_LOG("getMemory", tMem0, tMem1);
-
-    QF_MARK(tCpu0);
-    getCpu(cpuR.buf, sizeof(cpuR.buf));
-    QF_MARK(tCpu1);
-    QF_LOG("getCpu", tCpu0, tCpu1);
-
-    QF_MARK(tGpu0);
-    getGpu(gpuR.buf, sizeof(gpuR.buf));
-    QF_MARK(tGpu1);
-    QF_LOG("getGpu", tGpu0, tGpu1);
-
-    char *os = osR.buf, *shell = shellR.buf, *terminal = terminalR.buf;
+    char *os = cheapR.os.buf, *shell = cheapR.shell.buf, *terminal = cheapR.terminal.buf;
     char *cpu = cpuR.buf, *gpu = gpuR.buf;
-    double totalGiB = memR.totalGiB;
-    int usedPercent = memR.usedPercent;
+    double totalGiB = cheapR.mem.totalGiB;
+    int usedPercent = cheapR.mem.usedPercent;
 
     int n = 0;
     for (size_t mi = 0; mi < N_MODULES; mi++) {
